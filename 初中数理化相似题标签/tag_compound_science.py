@@ -264,23 +264,43 @@ def model_call(session, prompt, images, model, token, timeout, retries):
     if model.startswith('claude'):
         # Claude 的思考参数格式与豆包兼容模型不同，不能混用 enable_thinking。
         options = {'max_tokens': 8192, 'thinking': {'type': 'enabled', 'budget_tokens': 4096}}
-    body = {'model': model, 'messages': [{'role': 'user', 'content': content}], 'stream': False, **options}
+    elif model.startswith('deepseek'):
+        # deepseek 自带推理（返回 reasoning_content），门神不认 enable_thinking/thinking，也不认 reasoning_effort；传最小参数即可。
+        options = {'temperature': 0.1, 'max_tokens': 16384}
+    body = {'model': model, 'messages': [{'role': 'user', 'content': content}], 'stream': True, **options}
     errors = []
     call_started = time.perf_counter()
     for attempt in range(retries + 1):
         try:
             response = session.post('http://menshen.xdf.cn/v1/chat/completions',
                                     headers={'Authorization': token, 'Content-Type': 'application/json'},
-                                    json=body, timeout=(10, timeout))
+                                    json=body, timeout=(10, timeout), stream=True)
             if response.status_code >= 400:
                 raise RuntimeError(f'HTTP {response.status_code}: {response.text[:900]}')
-            payload = response.json()
-            choice = (payload.get('choices') or [{}])[0]
-            message = choice.get('message') or {}
-            raw = message.get('content') or ''
-            if isinstance(raw, list):
-                raw = ''.join(str(p.get('text', '')) if isinstance(p, dict) else str(p) for p in raw)
-            return raw, errors, {'usage': payload.get('usage'), 'finish_reason': choice.get('finish_reason'), 'options': options,
+            raw_parts = []
+            usage = None
+            finish_reason = None
+            for raw_line in response.iter_lines(decode_unicode=True):
+                line = (raw_line or '').strip()
+                if not line.startswith('data:'):
+                    continue
+                data = line[5:].strip()
+                if data == '[DONE]':
+                    break
+                try:
+                    chunk = json.loads(data)
+                except Exception:
+                    continue
+                choices = chunk.get('choices') or [{}]
+                delta = (choices[0].get('delta') or {}) if choices else {}
+                if delta.get('content'):
+                    raw_parts.append(delta['content'])
+                if choices and choices[0].get('finish_reason'):
+                    finish_reason = choices[0]['finish_reason']
+                if chunk.get('usage'):
+                    usage = chunk['usage']
+            raw = ''.join(raw_parts)
+            return raw, errors, {'usage': usage, 'finish_reason': finish_reason, 'options': options,
                                  'sent_images': sum(bool(x.get('data_url')) for x in images),
                                  '模型耗时秒': round(time.perf_counter() - call_started, 2), '尝试次数': attempt + 1}
         except Exception as e:
@@ -475,8 +495,8 @@ def main():
     parser.add_argument('--max-new', type=int, help='每次最多处理多少道待处理题，方便分批断点续跑')
     parser.add_argument('--retry-missing-images', action='store_true', help='重新处理图片缺失的成功记录')
     parser.add_argument('--compound-id', help='指定必须包含在样本中的复合题大题 ID')
-    parser.add_argument('--model', default='doubao-seed-2.0-pro')
-    parser.add_argument('--timeout', type=int, default=150)
+    parser.add_argument('--model', default='deepseek-v4.1-flash')
+    parser.add_argument('--timeout', type=int, default=300)
     parser.add_argument('--retries', type=int, default=1)
     parser.add_argument('--output-dir', type=Path)
     parser.add_argument('--input', type=Path, help='题目 ID Excel 文件路径；默认使用学科目录中的题目 ID 文件')
