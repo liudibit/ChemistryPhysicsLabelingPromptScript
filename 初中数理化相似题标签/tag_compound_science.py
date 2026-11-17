@@ -110,6 +110,84 @@ def label_catalog(subject):
     return catalog, guidance
 
 
+# 本地 JSONL 导出中的题型/结构代码转中文；未收录的代码原样保留，避免向提示词注入猜测的名称。
+JSONL_BUSINESS_TYPE_NAMES = {
+    'CHX-SYT': '实验题', 'CHX-TKT': '填空题', 'CHX-JST': '计算题', 'CHX-TDT': '推断题',
+    'CHX-GYLCT': '工艺流程题', 'CHX-KPYDT': '科普阅读题', 'CHX-ZONGHE': '综合题', 'CHX-QT': '其他',
+}
+JSONL_STRUCTURE_TYPE_NAMES = {
+    'fuhe': '复合题-题干', 'fuhe_zhuguan': '复合题-主观小题', 'fuhe_fillblank': '复合题-填空小题',
+    'fuhe_danxuan': '复合题-单选小题', 'fuhe_duoxuan': '复合题-多选小题', 'fuhe_panduan': '复合题-判断小题',
+    'danxuan': '单选题', 'duoxuan': '多选题', 'fillblank': '填空题', 'zhuguan': '主观题', 'panduan': '判断题',
+}
+
+
+def load_jsonl_compound_questions(path):
+    """从本地 JSONL 读取复合题，替代题库接口取题。
+
+    每行含 questions_map（各小题全文与分字段图片）；同一 parent_id 的题干行/小题行
+    合并为一份大题。返回 (按文件顺序的大题 ID 列表, {大题ID: 归一化小题列表})，
+    小题结构与 normalize_question 的输出一致，可直接进入 make_prompt。
+    """
+    rows = {}
+    with Path(path).open(encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            qmap = obj.get('questions_map')
+            if not isinstance(qmap, dict) or not qmap:
+                continue
+            pid = str(obj.get('parent_id') or obj.get('question_id') or '').strip()
+            if not pid:
+                continue
+            slot = rows.setdefault(pid, {'order': len(rows), 'top_images': [], 'map': {}})
+            slot['map'].update({str(k): v for k, v in qmap.items()})
+            top = (obj.get('metadata') or {}).get('stem_image_url') if isinstance(obj.get('metadata'), dict) else None
+            slot['top_images'] = unique(slot['top_images'] + [u for u in (obj.get('stem_image_url'), obj.get('image_url'), top) if u])
+    ordered, questions_by_id = [], {}
+    for pid, slot in sorted(rows.items(), key=lambda kv: kv[1]['order']):
+        qmap = slot['map']
+        keys = list(qmap.keys())
+
+        def sort_key(k):
+            item = qmap.get(k) or {}
+            try:
+                index = int(item.get('question_index') or 0)
+            except (TypeError, ValueError):
+                index = 0
+            return (0 if k == pid else 1, index, keys.index(k))
+
+        questions = []
+        for k in sorted(keys, key=sort_key):
+            item = qmap.get(k) or {}
+            images = {field: unique((item.get('images') or {}).get(field) or [])
+                      for field in ('stem', 'options', 'analysis', 'answer')}
+            questions.append({
+                'questionId': k,
+                'businessTypeName': JSONL_BUSINESS_TYPE_NAMES.get(item.get('business_type'), str(item.get('business_type') or '未知')),
+                'structureTypeName': JSONL_STRUCTURE_TYPE_NAMES.get(item.get('structure_type'), str(item.get('structure_type') or '未知')),
+                'stem': str(item.get('stem') or '').strip(),
+                'options': str(item.get('options') or '').strip(),
+                'answer': str(item.get('answer') or '').strip(),
+                'analysis': str(item.get('analysis') or '').strip(),
+                'knowledge': '', 'solution': '',
+                'fieldImages': images,
+                'imageUrls': unique(url for field in ('stem', 'options', 'analysis', 'answer') for url in images[field]),
+                'raw': item,
+            })
+        # 整题在 questions_map 中没有任何原图时，用顶层整题截图兜底；已有分字段原图时不重复发送截图。
+        if slot['top_images'] and not any(q['imageUrls'] for q in questions):
+            questions[0]['fieldImages']['stem'] = unique(slot['top_images'] + questions[0]['fieldImages']['stem'])
+            questions[0]['imageUrls'] = unique(questions[0]['fieldImages']['stem'] + questions[0]['imageUrls'])
+        ordered.append(pid)
+        questions_by_id[pid] = questions
+    if not ordered:
+        raise RuntimeError(f'未能从 JSONL 中读取到复合题：{path}')
+    return ordered, questions_by_id
+
+
 def make_prompt(subject, big_id, questions, catalog, guidance):
     """将同一大题的共用信息和全部小题合并为一次模型请求。"""
     name = '初中物理' if subject == 'physics' else '初中化学'
@@ -147,15 +225,15 @@ def make_prompt(subject, big_id, questions, catalog, guidance):
             '4. 题型特征描述实际作答结构，优先选择最具体的末级标签；知识内容只选大题实际考查的核心化学知识。'
             '物质五维只在实际涉及具体物质及其性质、用途、制备、存在形式或检验时选；'
             '方程式环节只在题目实际涉及该反应或方程式时选；两者不能被知识内容维度替代或强行填满。\n'
-             '【高风险排除规则，优先级高于标签名称相似性】\n'
-             '1. “化学实验操作”仅用于实际考查具体操作步骤、规范或器材使用；'
-             '药品存放、仪器名称识别不得仅因此标注。\n'
-             '2. “装置图分析型”要求答案依赖装置结构、连接、功能或操作分析；'
-             '题面有装置图但不分析装置时不得标注。\n'
-             '3. “X-性质分析”要求题目直接考查该物质的物理或化学性质；'
-             '分子运动、微粒间隔、相变微观解释不得据此标注。\n'
-             '4. 化学方程式环节标签要求对应反应环节是实际作答或判分点；'
-             '仅在题干、选项或背景材料中出现反应不得标注。\n'
+                '【高风险排除规则，优先级高于标签名称相似性】\n'
+            '1. “化学实验操作”仅用于实际考查具体操作步骤、规范或器材使用；'
+            '药品存放、仪器名称识别不得仅因此标注。\n'
+            '2. “装置图分析型”要求答案依赖装置结构、连接、功能或操作分析；'
+            '题面有装置图但不分析装置时不得标注。\n'
+            '3. “X-性质分析”要求题目直接考查该物质的物理或化学性质；'
+            '分子运动、微粒间隔、相变微观解释不得据此标注。\n'
+            '4. 化学方程式环节标签要求对应反应环节是实际作答或判分点；'
+            '仅在题干、选项或背景材料中出现反应不得标注。\n'
             '5. 认知素养只选完成任务实际要求的能力；情境方法必须有明确素材情境或科学方法证据。'
             '答案信息可同时描述答案形式与信息载体，但必须有题面或图片证据。'
             '交叉组合只在确有跨学段、课标大概念或跨模块联系时选；'
@@ -170,6 +248,7 @@ def make_prompt(subject, big_id, questions, catalog, guidance):
             '12. 题型特征聚类树里的"选择题"标签，一律以题干实际呈现的选项形式与作答方式判定，不得以题库题型字段（businessTypeName）为准：- 「常规四选一（单项选择）」仅当题干给出 4 个相互独立的选项、且从中选 1 个时使用；- 选项由"①②③④ 等多条陈述组合而成、需综合判断后选组合"的，标「组合式单选题」；- 有多个合理项、需选最优的，标「最佳选择题」；- 需选出两个及以上正确答案的，标「多项选择题」；- 选项数量不是 4 个时，不得标「常规四选一（单项选择）」；- 题库题型与题干实际作答结构不一致时，以题干实际呈现为准。\n'
             '13.「认知与素养维度」只选完成作答实际必需的认知能力与核心素养，每个核心素养标签都要有题干/解析中的明确证据：其中「证据推理」仅限题目实际基于实验证据（实验现象、实验数据、实验事实）进行逻辑推理时才标；仅书写或配平化学方程式、回忆概念符号、直接计算而不涉及实验证据的题目不能标「证据推理」。\n'
             '14. 知识内容只选"设问直接要求作答、判断或解释"的知识点；仅为作答所依赖的前置/工具性知识一律不选。选择的知识内容维度的标签以题干实际考察内容为主，解析为辅。题干未提及而解析提及时不选。'
+            '15.「记忆-符号识别」仅当题面给出符号、化学式或图标并要求解读其含义时使用。'
         )
     rules += ('以下是官方候选标签全集；\n标签全集：'
               + json.dumps(catalog, ensure_ascii=False, separators=(',', ':')) + '\n标签判定说明：\n' + guidance_text
@@ -482,7 +561,7 @@ def output_review(path, records, dims):
                 'model_name': audit_by_id.get(str(r['id']), {}).get('模型', '')}
                for r in records]
     data = json.dumps(records, ensure_ascii=False).replace('</', '<\\/')
-    page = r'''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>复合题大题级人工复核</title><style>body{margin:0;background:#f5f7f4;color:#22342e;font:14px/1.6 system-ui,'Microsoft YaHei',sans-serif}header{padding:20px;background:#193b30;color:white;position:sticky;top:0}header input{padding:8px;width:260px}main{max-width:1250px;margin:auto;padding:16px}article{background:white;border:1px solid #d9e2d9;padding:18px;margin:18px 0;border-radius:8px}.q{padding:12px;border:1px solid #d9e2d9;margin:10px 0}p{white-space:pre-wrap}img{max-width:460px;max-height:380px;margin:8px;border:1px solid #ddd}table{border-collapse:collapse;width:100%}th,td{padding:8px;border:1px solid #d9e2d9;text-align:left;vertical-align:top}th{width:190px;background:#eff5ef}details{margin:10px 0}summary{cursor:pointer}textarea{width:98%;min-height:60px}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:520px;overflow:auto;background:#f1f5f1;padding:12px;border-radius:6px}button{padding:9px;cursor:pointer}</style><header><h2>__TITLE__ · 复合题大题级人工复核</h2><input id="search" placeholder="搜索大题 ID 或题干"> <button id="export">导出人工复核意见</button></header><main><p>每张大题卡包含全部小题。人工填写后请在离开页面前导出 JSON。</p><div id="app"></div></main><script>const DATA=__DATA__,DIMS=__DIMS__,saved={};const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));function collect(){document.querySelectorAll('article[data-id]').forEach(card=>saved[card.dataset.id]={decision:card.querySelector('select').value,note:card.querySelector('textarea').value})}function render(){collect();let term=document.querySelector('#search').value.trim().toLowerCase();document.querySelector('#app').innerHTML=DATA.filter(r=>!term||JSON.stringify(r.questions).toLowerCase().includes(term)||r.id.includes(term)).map(r=>`<article data-id="${esc(r.id)}"><h2>大题 ${esc(r.id)} · ${r.questions.length} 部分 · ${esc(r.status)}</h2><details open><summary>完整原题与图片</summary>${r.questions.map((q,i)=>`<div class="q"><b>第 ${i+1} 部分：${esc(q.questionId)}</b><p>题型：${esc(q.businessTypeName)} / ${esc(q.structureTypeName)}</p>${['stem','options','answer','analysis'].map((k,j)=>`<p><b>${['题干','选项','答案','解析'][j]}：</b>${esc(q[k])||'—'}</p>`).join('')}</div>`).join('')}${r.images.map(x=>x.local?`<a href="${esc(x.url)}" target="_blank"><img loading="lazy" src="${esc(x.local)}" alt="题目图片"></a>`:`<span>图片下载失败：${esc(x.error)}</span>`).join('')}</details><h3>大题级标签</h3><table>${DIMS.map(d=>`<tr><th>${esc(d)}</th><td>${esc((r.tags[d]||[]).join('｜'))||'—'}</td></tr>`).join('')}</table><p><b>备注：</b>${esc(r.remarks.join('；'))||'—'}　<b>错误：</b>${esc(r.errors.join('；'))||'—'}</p><p><b>耗时：</b>${r.elapsed??'—'} 秒　<b>tokens：</b>入 ${(r.usage||{})['输入tokens']??'—'}／出 ${(r.usage||{})['输出tokens']??'—'}（思考 ${(r.usage||{})['思考tokens']??'—'}）</p><details><summary>查看发送的提示词（${esc(r.model_name||'未记录模型')}）</summary><pre>${esc(r.model_prompt)||'审计记录未找到提示词'}</pre></details><details><summary>查看模型原始输出</summary><p><b>模型调用信息：</b>${esc(JSON.stringify(r.model_meta||{}))}</p><pre>${esc(r.model_raw)||'审计记录未找到模型输出'}</pre></details><label>人工结论 <select><option value="">未复核</option>${['准确','部分准确','不准确','无法判断'].map(v=>`<option ${saved[r.id]?.decision===v?'selected':''}>${v}</option>`).join('')}</select></label><p><textarea placeholder="记录应修改的标签及依据">${esc(saved[r.id]?.note||'')}</textarea></p></article>`).join('')};document.querySelector('#search').oninput=render;document.querySelector('#export').onclick=()=>{collect();let blob=new Blob([JSON.stringify(DATA.map(r=>({大题ID:r.id,...(saved[r.id]||{})})),null,2)],{type:'application/json'}),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='人工复核意见.json';a.click()};render()</script>'''
+    page = r'''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>复合题大题级人工复核</title><style>body{margin:0;background:#f5f7f4;color:#22342e;font:14px/1.6 system-ui,'Microsoft YaHei',sans-serif}header{padding:20px;background:#193b30;color:white;position:sticky;top:0}header input{padding:8px;width:260px}main{max-width:1250px;margin:auto;padding:16px}article{background:white;border:1px solid #d9e2d9;padding:18px;margin:18px 0;border-radius:8px}.q{padding:12px;border:1px solid #d9e2d9;margin:10px 0}p{white-space:pre-wrap}img{max-width:460px;max-height:380px;margin:8px;border:1px solid #ddd}table{border-collapse:collapse;width:100%}th,td{padding:8px;border:1px solid #d9e2d9;text-align:left;vertical-align:top}th{width:190px;background:#eff5ef}details{margin:10px 0}summary{cursor:pointer}textarea{width:98%;min-height:60px}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:520px;overflow:auto;background:#f1f5f1;padding:12px;border-radius:6px}button{padding:9px;cursor:pointer}</style><header><h2>__TITLE__ · 复合题大题级人工复核</h2><input id="search" placeholder="搜索大题 ID 或题干"> <button id="export">导出人工复核意见</button></header><main><p>每张大题卡包含全部小题。人工填写后请在离开页面前导出 JSON。</p><div id="app"></div></main><script>const DATA=__DATA__,DIMS=__DIMS__,saved={};const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));function imgHtml(im,label){return im.local?`<a href="${esc(im.url)}" target="_blank"><img loading="lazy" src="${esc(im.local)}" alt="${label}图片"></a>`:`<span>图片下载失败：${esc(im.error||'未知原因')}</span>`}function fieldHtml(q,k,label){const imgs=(q.fieldImages||{})[k]||[];const parts=String(q[k]??'').split('<image>');let out='';if(parts.length===1){out+=esc(parts[0]);imgs.forEach(im=>{out+=imgHtml(im,label)})}else{parts.forEach((seg,i)=>{out+=esc(seg);if(i<imgs.length){out+=imgHtml(imgs[i],label)}});for(let i=parts.length-1;i<imgs.length;i++){out+=imgHtml(imgs[i],label)}}return `<p><b>${label}：</b>${out||'—'}</p>`}function collect(){document.querySelectorAll('article[data-id]').forEach(card=>saved[card.dataset.id]={decision:card.querySelector('select').value,note:card.querySelector('textarea').value})}function render(){collect();let term=document.querySelector('#search').value.trim().toLowerCase();document.querySelector('#app').innerHTML=DATA.filter(r=>!term||JSON.stringify(r.questions).toLowerCase().includes(term)||r.id.includes(term)).map(r=>`<article data-id="${esc(r.id)}"><h2>大题 ${esc(r.id)} · ${r.questions.length} 部分 · ${esc(r.status)}</h2><details open><summary>完整原题与图片</summary>${r.questions.map((q,i)=>`<div class="q"><b>第 ${i+1} 部分：${esc(q.questionId)}</b><p>题型：${esc(q.businessTypeName)} / ${esc(q.structureTypeName)}</p>${['stem','options','answer','analysis'].map((k,j)=>fieldHtml(q,k,['题干','选项','答案','解析'][j])).join('')}</div>`).join('')}${r.questions.some(q=>q.fieldImages)?'':r.images.map(x=>x.local?`<a href="${esc(x.url)}" target="_blank"><img loading="lazy" src="${esc(x.local)}" alt="题目图片"></a>`:`<span>图片下载失败：${esc(x.error)}</span>`).join('')}</details><h3>大题级标签</h3><table>${DIMS.map(d=>`<tr><th>${esc(d)}</th><td>${esc((r.tags[d]||[]).join('｜'))||'—'}</td></tr>`).join('')}</table><p><b>备注：</b>${esc(r.remarks.join('；'))||'—'}　<b>错误：</b>${esc(r.errors.join('；'))||'—'}</p><p><b>耗时：</b>${r.elapsed??'—'} 秒　<b>tokens：</b>入 ${(r.usage||{})['输入tokens']??'—'}／出 ${(r.usage||{})['输出tokens']??'—'}（思考 ${(r.usage||{})['思考tokens']??'—'}）</p><details><summary>查看发送的提示词（${esc(r.model_name||'未记录模型')}）</summary><pre>${esc(r.model_prompt)||'审计记录未找到提示词'}</pre></details><details><summary>查看模型原始输出</summary><p><b>模型调用信息：</b>${esc(JSON.stringify(r.model_meta||{}))}</p><pre>${esc(r.model_raw)||'审计记录未找到模型输出'}</pre></details><label>人工结论 <select><option value="">未复核</option>${['准确','部分准确','不准确','无法判断'].map(v=>`<option ${saved[r.id]?.decision===v?'selected':''}>${v}</option>`).join('')}</select></label><p><textarea placeholder="记录应修改的标签及依据">${esc(saved[r.id]?.note||'')}</textarea></p></article>`).join('')};document.querySelector('#search').oninput=render;document.querySelector('#export').onclick=()=>{collect();let blob=new Blob([JSON.stringify(DATA.map(r=>({大题ID:r.id,...(saved[r.id]||{})})),null,2)],{type:'application/json'}),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='人工复核意见.json';a.click()};render()</script>'''
     page = page.replace('__TITLE__', html.escape(path.parent.parent.name)).replace('__DIMS__', json.dumps(dims, ensure_ascii=False)).replace('__DATA__', data)
     path.write_text(page, encoding='utf-8')
 
@@ -499,7 +578,7 @@ def main():
     parser.add_argument('--timeout', type=int, default=300)
     parser.add_argument('--retries', type=int, default=1)
     parser.add_argument('--output-dir', type=Path)
-    parser.add_argument('--input', type=Path, help='题目 ID Excel 文件路径；默认使用学科目录中的题目 ID 文件')
+    parser.add_argument('--input', type=Path, help='题目 ID Excel/txt 路径，或含 questions_map 的 JSONL 题目文件；默认使用学科目录中的题目 ID 文件')
     args = parser.parse_args()
     if args.limit <= 0 or args.workers <= 0 or (args.max_new is not None and args.max_new <= 0):
         raise ValueError('--limit、--workers 和 --max-new 必须大于 0')
@@ -508,17 +587,16 @@ def main():
     token = os.getenv('MENSHEN_TOKEN', '').strip()
     if not token:
         raise RuntimeError('MENSHEN_TOKEN 缺失')
-    keys = {k: os.getenv(v, '') for k, v in [('appCode','TIKU_APP_CODE'),('businessCode','TIKU_BUSINESS_CODE'),('appToken','TIKU_APP_TOKEN')]}
-    if any(not v for v in keys.values()):
-        raise RuntimeError('题库接口环境变量缺失')
-    timestamp = os.getenv('TIKU_TIMESTAMP', '')
-    if not timestamp:
-        raise RuntimeError('当前题库账号需 .env 中的 TIKU_TIMESTAMP')
     catalog, guidance = label_catalog(args.subject)
     input_file = args.input or (conf['directory'] / conf['ids'])
     if not input_file.is_file():
         raise FileNotFoundError(f'题目 ID 文件不存在：{input_file}')
-    ids = load_question_ids(input_file)
+    local_questions = {}
+    if input_file.suffix.lower() == '.jsonl':
+        # JSONL 自带小题全文与图片，直接本地取题，不再请求题库接口。
+        ids, local_questions = load_jsonl_compound_questions(input_file)
+    else:
+        ids = load_question_ids(input_file)
     # 默认只取前 limit 道作抽样；全量执行时需显式传入不小于 ID 总数的 --limit。
     selected = ids[:args.limit]
     if args.compound_id:
@@ -528,6 +606,15 @@ def main():
             selected[-1] = args.compound_id
     folder = args.output_dir or conf['directory'] / 'outputs' / ('复合题打标测试_' + datetime.now().strftime('%Y%m%d_%H%M%S'))
     folder.mkdir(parents=True, exist_ok=True)
+    if any(qid not in local_questions for qid in selected):
+        keys = {k: os.getenv(v, '') for k, v in [('appCode','TIKU_APP_CODE'),('businessCode','TIKU_BUSINESS_CODE'),('appToken','TIKU_APP_TOKEN')]}
+        if any(not v for v in keys.values()):
+            raise RuntimeError('题库接口环境变量缺失')
+        timestamp = os.getenv('TIKU_TIMESTAMP', '')
+        if not timestamp:
+            raise RuntimeError('当前题库账号需 .env 中的 TIKU_TIMESTAMP')
+    else:
+        keys, timestamp = {}, ''
     selection_file = folder / '抽样题目ID.json'
     if selection_file.exists() and json.loads(selection_file.read_text(encoding='utf-8')) != selected:
         raise RuntimeError('该输出目录属于不同题目列表，请另选输出目录，避免断点结果混淆')
@@ -547,8 +634,11 @@ def main():
         # 函数只返回结果，主线程负责落盘，避免并发写入 JSONL/断点文件造成文件损坏。
         question_started = time.perf_counter()
         session = requests.Session()
-        payload, questions, fetch_errors = fetch_questions(session, 'https://tps-tiku-api.staff.xdf.cn/api/question/v2/query-by-questionIds',
-                                                            keys, qid, (10, args.timeout), args.retries, timestamp)
+        if qid in local_questions:
+            payload, questions, fetch_errors = None, local_questions[qid], []
+        else:
+            payload, questions, fetch_errors = fetch_questions(session, 'https://tps-tiku-api.staff.xdf.cn/api/question/v2/query-by-questionIds',
+                                                                keys, qid, (10, args.timeout), args.retries, timestamp)
         prompt = ''
         images = []
         raw = ''
@@ -580,7 +670,7 @@ def main():
                 except Exception as e:
                     errors.append(f'模型结果解析失败：{type(e).__name__}: {e}')
         else:
-            errors.append('题库接口没有返回大题和小题')
+            errors.append('题库接口/本地文件没有返回大题和小题')
         img_fields = {field: unique(url for q in questions for url in q.get('fieldImages', {}).get(field, []))
                       for field in ('stem', 'analysis', 'answer')}
         elapsed = round(time.perf_counter() - question_started, 2)
@@ -591,12 +681,23 @@ def main():
                '耗时秒': elapsed, '输入tokens': usage['输入tokens'], '输出tokens': usage['输出tokens'],
                '思考tokens': usage['思考tokens'],
                '备注': '\n'.join(remarks), '状态': status, '错误信息': '\n'.join(errors)}
-        record = {'id': qid, 'questions': [{k: q.get(k, '') for k in ('questionId','businessTypeName','structureTypeName','stem','options','answer','analysis','knowledge','solution')} for q in questions],
+        image_by_url = {item['url']: item for item in images}
+
+        def question_view(q):
+            view = {k: q.get(k, '') for k in ('questionId','businessTypeName','structureTypeName','stem','options','answer','analysis','knowledge','solution')}
+            # 每个字段的图片附上下载结果（本地路径/失败原因），复核页按字段内联显示。
+            view['fieldImages'] = {field: [{k2: v2 for k2, v2 in image_by_url.get(url, {'url': url, 'error': '未下载'}).items() if k2 != 'data_url'}
+                                           for url in q.get('fieldImages', {}).get(field, [])]
+                                   for field in ('stem', 'options', 'answer', 'analysis')}
+            return view
+
+        record = {'id': qid, 'questions': [question_view(q) for q in questions],
                   'tags': tags, 'remarks': remarks, 'status': status, 'errors': errors,
                   'elapsed': elapsed, 'usage': usage,
                   'images': [{k: v for k, v in item.items() if k != 'data_url'} for item in images], 'row': row}
         session.close()
-        audit_record = {'大题ID': qid, '题目来源': '题库接口', '题库错误': fetch_errors, '题目': record['questions'],
+        audit_record = {'大题ID': qid, '题目来源': '本地JSONL' if qid in local_questions else '题库接口',
+                        '题库错误': fetch_errors, '题目': record['questions'],
                         '图片': record['images'], '模型': args.model, '模型输入': prompt, '模型输出': raw,
                         '模型元数据': meta, '耗时秒': elapsed, 'token用量': usage,
                         '标签': tags, '备注': remarks, '状态': status, '错误': errors}
