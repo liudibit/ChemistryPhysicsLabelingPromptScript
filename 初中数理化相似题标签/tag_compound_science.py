@@ -17,6 +17,9 @@ import re
 import sys
 import time
 
+import asyncio
+
+import aiohttp
 import requests
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -26,7 +29,7 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parent
 MATH = ROOT / '初中数学'
 sys.path.insert(0, str(MATH))
-from math_tag_common import fetch_questions, load_env_file, load_question_ids  # noqa: E402
+from math_tag_common import extract_api_questions, fetch_questions, load_env_file, load_question_ids, normalize_question  # noqa: E402
 
 # 延续旧版化学打标页 DEFAULT_PROMPT 的每维度数量上限。
 CHEM_MAX_TAGS = {
@@ -112,22 +115,51 @@ def label_catalog(subject):
 
 # 本地 JSONL 导出中的题型/结构代码转中文；未收录的代码原样保留，避免向提示词注入猜测的名称。
 JSONL_BUSINESS_TYPE_NAMES = {
-    'CHX-SYT': '实验题', 'CHX-TKT': '填空题', 'CHX-JST': '计算题', 'CHX-TDT': '推断题',
-    'CHX-GYLCT': '工艺流程题', 'CHX-KPYDT': '科普阅读题', 'CHX-ZONGHE': '综合题', 'CHX-QT': '其他',
+    'CHX-SYT': '实验题', 'CHX-TKT': '填空题', 'CHX-JDT': '解答题',
+    'CHX-KXTJT': '科学探究题', 'CHX-JST': '计算题', 'CHX-TDT': '推断题',
+    'CHX-GYLCT': '工业流程题', 'CHX-KPYDT': '科普阅读题', 'CHX-ZONGHE': '综合题', 'CHX-QT': '其他',
 }
 JSONL_STRUCTURE_TYPE_NAMES = {
-    'fuhe': '复合题-题干', 'fuhe_zhuguan': '复合题-主观小题', 'fuhe_fillblank': '复合题-填空小题',
-    'fuhe_danxuan': '复合题-单选小题', 'fuhe_duoxuan': '复合题-多选小题', 'fuhe_panduan': '复合题-判断小题',
-    'danxuan': '单选题', 'duoxuan': '多选题', 'fillblank': '填空题', 'zhuguan': '主观题', 'panduan': '判断题',
+    'fuhe': '复合题', 'fuhe_zhuguan': '简答题', 'fuhe_fillblank': '填空题',
+    'fuhe_danxuan': '单选题', 'fuhe_duoxuan': '多选题', 'fuhe_panduan': '判断题',
+    'danxuan': '单选题', 'duoxuan': '多选题', 'fillblank': '填空题', 'zhuguan': '简答题', 'panduan': '判断题',
 }
+
+
+def _jsonl_image_urls(value):
+    """把 JSONL 中字符串或图片对象列表统一成 URL 列表。"""
+    urls = []
+
+    def walk(node):
+        if node is None:
+            return
+        if isinstance(node, str):
+            if node.strip():
+                urls.append(node.strip())
+            return
+        if isinstance(node, (list, tuple, set)):
+            for item in node:
+                walk(item)
+            return
+        if isinstance(node, dict):
+            for key in ('url', 'src', 'imageUrl', 'imageURL', 'path'):
+                if key in node:
+                    walk(node[key])
+            for key in ('urls', 'images', 'imageUrls', 'imageURLs'):
+                if key in node:
+                    walk(node[key])
+
+    walk(value)
+    return unique(urls)
 
 
 def load_jsonl_compound_questions(path):
-    """从本地 JSONL 读取复合题，替代题库接口取题。
+    """从本地 JSONL 读取复合题，支持两种格式。
 
-    每行含 questions_map（各小题全文与分字段图片）；同一 parent_id 的题干行/小题行
-    合并为一份大题。返回 (按文件顺序的大题 ID 列表, {大题ID: 归一化小题列表})，
-    小题结构与 normalize_question 的输出一致，可直接进入 make_prompt。
+    1. 题库接口原始 JSONL：每行含 questionId/questionInfo/smallQuestions，
+       使用与在线取题完全相同的 extract_api_questions + normalize_question。
+    2. 新版 questions_map JSONL：优先读取条目里的 _source_item 并重新归一化；
+       旧文件没有 _source_item 时，才使用已清洗字段兼容读取。
     """
     rows = {}
     with Path(path).open(encoding='utf-8') as f:
@@ -136,48 +168,93 @@ def load_jsonl_compound_questions(path):
             if not line:
                 continue
             obj = json.loads(line)
+
             qmap = obj.get('questions_map')
-            if not isinstance(qmap, dict) or not qmap:
+            if isinstance(qmap, dict) and qmap:
+                pid = str(obj.get('parent_id') or obj.get('question_id') or '').strip()
+                if not pid:
+                    continue
+                slot = rows.setdefault(pid, {'order': len(rows), 'top_images': [], 'map': {}, 'questions': []})
+                slot['map'].update({str(k): v for k, v in qmap.items()})
+                top = (obj.get('metadata') or {}).get('stem_image_url') if isinstance(obj.get('metadata'), dict) else None
+                slot['top_images'] = unique(slot['top_images'] + [u for u in (obj.get('stem_image_url'), obj.get('image_url'), top) if u])
                 continue
-            pid = str(obj.get('parent_id') or obj.get('question_id') or '').strip()
+
+            # 兼容直接传入题库接口原始响应/原始题目 JSONL。
+            pid = str(obj.get('question_id') or obj.get('questionId') or '').strip()
             if not pid:
                 continue
-            slot = rows.setdefault(pid, {'order': len(rows), 'top_images': [], 'map': {}})
-            slot['map'].update({str(k): v for k, v in qmap.items()})
-            top = (obj.get('metadata') or {}).get('stem_image_url') if isinstance(obj.get('metadata'), dict) else None
-            slot['top_images'] = unique(slot['top_images'] + [u for u in (obj.get('stem_image_url'), obj.get('image_url'), top) if u])
+            raw_questions = extract_api_questions(obj, pid)
+            if not raw_questions:
+                continue
+            slot = rows.setdefault(pid, {'order': len(rows), 'top_images': [], 'map': {}, 'questions': []})
+            normalized = [normalize_question(raw, index) for index, raw in enumerate(raw_questions, 1)]
+            slot['questions'].extend(normalized)
+            slot['top_images'] = unique(slot['top_images'] + [
+                obj.get('stem_image_url'), obj.get('stemImageUrl'), obj.get('image_url'), obj.get('imageUrl')
+            ])
+
     ordered, questions_by_id = [], {}
     for pid, slot in sorted(rows.items(), key=lambda kv: kv[1]['order']):
-        qmap = slot['map']
-        keys = list(qmap.keys())
+        if slot['questions']:
+            # 原始接口展开顺序就是父题在前、小题按接口顺序返回，不能再排序。
+            by_id = {}
+            for question in slot['questions']:
+                qid = str(question.get('questionId') or '').strip()
+                if qid and qid not in by_id:
+                    by_id[qid] = question
+            questions = list(by_id.values())
+        else:
+            qmap = slot['map']
+            keys = list(qmap.keys())
 
-        def sort_key(k):
-            item = qmap.get(k) or {}
-            try:
-                index = int(item.get('question_index') or 0)
-            except (TypeError, ValueError):
-                index = 0
-            return (0 if k == pid else 1, index, keys.index(k))
+            def sort_key(k):
+                item = qmap.get(k) or {}
+                try:
+                    index = int(item.get('question_index') or 0)
+                except (TypeError, ValueError):
+                    index = 0
+                return (0 if k == pid else 1, index, keys.index(k))
 
-        questions = []
-        for k in sorted(keys, key=sort_key):
-            item = qmap.get(k) or {}
-            images = {field: unique((item.get('images') or {}).get(field) or [])
-                      for field in ('stem', 'options', 'analysis', 'answer')}
-            questions.append({
-                'questionId': k,
-                'businessTypeName': JSONL_BUSINESS_TYPE_NAMES.get(item.get('business_type'), str(item.get('business_type') or '未知')),
-                'structureTypeName': JSONL_STRUCTURE_TYPE_NAMES.get(item.get('structure_type'), str(item.get('structure_type') or '未知')),
-                'stem': str(item.get('stem') or '').strip(),
-                'options': str(item.get('options') or '').strip(),
-                'answer': str(item.get('answer') or '').strip(),
-                'analysis': str(item.get('analysis') or '').strip(),
-                'knowledge': '', 'solution': '',
-                'fieldImages': images,
-                'imageUrls': unique(url for field in ('stem', 'options', 'analysis', 'answer') for url in images[field]),
-                'raw': item,
-            })
-        # 整题在 questions_map 中没有任何原图时，用顶层整题截图兜底；已有分字段原图时不重复发送截图。
+            questions = []
+            for index, k in enumerate(sorted(keys, key=sort_key), 1):
+                item = qmap.get(k) or {}
+                source_item = item.get('_source_item')
+                if isinstance(source_item, dict):
+                    question = normalize_question(source_item, index)
+                    question['questionId'] = str(k or question.get('questionId') or '')
+                    if not question.get('businessTypeName'):
+                        question['businessTypeName'] = str(item.get('business_type_name') or '')
+                    if not question.get('structureTypeName'):
+                        question['structureTypeName'] = str(item.get('structure_type_name') or '')
+                    questions.append(question)
+                    continue
+
+                raw_images = item.get('fieldImages') or item.get('images') or {}
+                images = {
+                    field: _jsonl_image_urls(raw_images.get(field))
+                    for field in ('stem', 'options', 'analysis', 'answer')
+                }
+                knowledge = item.get('knowledge', item.get('knwInfos', ''))
+                solution = item.get('solution', item.get('solvingIdea', ''))
+                questions.append({
+                    'questionId': k,
+                    'businessTypeName': item.get('business_type_name') or JSONL_BUSINESS_TYPE_NAMES.get(
+                        item.get('business_type'), str(item.get('business_type') or '未知')),
+                    'structureTypeName': item.get('structure_type_name') or JSONL_STRUCTURE_TYPE_NAMES.get(
+                        item.get('structure_type'), str(item.get('structure_type') or '未知')),
+                    'stem': str(item.get('stem') or '').strip(),
+                    'options': str(item.get('options') or '').strip(),
+                    'answer': str(item.get('answer') or '').strip(),
+                    'analysis': str(item.get('analysis') or '').strip(),
+                    'knowledge': knowledge or '',
+                    'solution': str(solution or '').strip(),
+                    'fieldImages': images,
+                    'imageUrls': unique(url for field in ('stem', 'options', 'analysis', 'answer') for url in images[field]),
+                    'raw': item,
+                })
+
+        # 整题在题目内容中没有任何原图时，用顶层整题截图兜底；已有分字段原图时不重复发送截图。
         if slot['top_images'] and not any(q['imageUrls'] for q in questions):
             questions[0]['fieldImages']['stem'] = unique(slot['top_images'] + questions[0]['fieldImages']['stem'])
             questions[0]['imageUrls'] = unique(questions[0]['fieldImages']['stem'] + questions[0]['imageUrls'])
@@ -248,7 +325,7 @@ def make_prompt(subject, big_id, questions, catalog, guidance):
             '12. 题型特征聚类树里的"选择题"标签，一律以题干实际呈现的选项形式与作答方式判定，不得以题库题型字段（businessTypeName）为准：- 「常规四选一（单项选择）」仅当题干给出 4 个相互独立的选项、且从中选 1 个时使用；- 选项由"①②③④ 等多条陈述组合而成、需综合判断后选组合"的，标「组合式单选题」；- 有多个合理项、需选最优的，标「最佳选择题」；- 需选出两个及以上正确答案的，标「多项选择题」；- 选项数量不是 4 个时，不得标「常规四选一（单项选择）」；- 题库题型与题干实际作答结构不一致时，以题干实际呈现为准。\n'
             '13.「认知与素养维度」只选完成作答实际必需的认知能力与核心素养，每个核心素养标签都要有题干/解析中的明确证据：其中「证据推理」仅限题目实际基于实验证据（实验现象、实验数据、实验事实）进行逻辑推理时才标；仅书写或配平化学方程式、回忆概念符号、直接计算而不涉及实验证据的题目不能标「证据推理」。\n'
             '14. 知识内容只选"设问直接要求作答、判断或解释"的知识点；仅为作答所依赖的前置/工具性知识一律不选。选择的知识内容维度的标签以题干实际考察内容为主，解析为辅。题干未提及而解析提及时不选。'
-            '15.「记忆-符号识别」仅当题面给出符号、化学式或图标并要求解读其含义时使用。'
+            '15.「记忆-符号识别」仅当题面给出符号、化学式或图标并要求解读其含义时使用。\n'
         )
     rules += ('以下是官方候选标签全集；\n标签全集：'
               + json.dumps(catalog, ensure_ascii=False, separators=(',', ':')) + '\n标签判定说明：\n' + guidance_text
@@ -294,16 +371,16 @@ def compress_image_bytes(img_bytes, max_pixels=IMG_MAX_PIXELS):
     return buf.getvalue()
 
 
-def create_images(session, urls, directory, timeout):
-    """下载复核原图，同时生成模型请求需要的 data URL；单张失败不阻断整题打标。"""
-    items = []
+async def create_images(session, urls, directory, timeout):
+    """异步并发下载复核原图并生成 data URL；单张失败不阻断整题打标。"""
     directory.mkdir(parents=True, exist_ok=True)
-    for index, url in enumerate(urls, 1):
+
+    async def fetch_one(index, url):
         item = {'url': url, 'local': '', 'error': ''}
         try:
-            response = session.get(url, timeout=(10, timeout))
-            response.raise_for_status()
-            content = response.content
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout, connect=10)) as resp:
+                resp.raise_for_status()
+                content = await resp.read()
             if content.startswith(b'\xff\xd8'):
                 mime, suffix = 'image/jpeg', '.jpg'
             elif content.startswith(b'\x89PNG'):
@@ -325,16 +402,28 @@ def create_images(session, urls, directory, timeout):
             if width < 14 or height < 14:
                 item['error'] = f'图片尺寸过小（{width}x{height}），未发送模型'
             else:
-                compressed = compress_image_bytes(content)
+                compressed = await asyncio.to_thread(compress_image_bytes, content)
                 item['data_url'] = 'data:image/png;base64,' + base64.b64encode(compressed).decode('ascii')
         except Exception as e:
             item['error'] = f'{type(e).__name__}: {e}'
-        items.append(item)
-    return items
+        return item
+
+    return list(await asyncio.gather(*[fetch_one(i, u) for i, u in enumerate(urls, 1)]))
 
 
-def model_call(session, prompt, images, model, token, timeout, retries):
-    """调用门神兼容接口，并保留实际请求配置供审计与人工复核。"""
+async def _iter_sse_data(content):
+    """按行读取 SSE，避免 aiohttp 网络分块把多个 data 事件粘在一起或截断。"""
+    while True:
+        raw_line = await content.readline()
+        if not raw_line:
+            break
+        line = raw_line.decode('utf-8', 'ignore').strip()
+        if line.startswith('data:'):
+            yield line[5:].strip()
+
+
+async def model_call(session, prompt, images, model, token, timeout, retries):
+    """异步调用门神兼容接口（流式），并保留实际请求配置供审计与人工复核。"""
     content = [{'type': 'text', 'text': prompt}]
     for item in images:
         if item.get('data_url'):
@@ -351,33 +440,30 @@ def model_call(session, prompt, images, model, token, timeout, retries):
     call_started = time.perf_counter()
     for attempt in range(retries + 1):
         try:
-            response = session.post('http://menshen.xdf.cn/v1/chat/completions',
-                                    headers={'Authorization': token, 'Content-Type': 'application/json'},
-                                    json=body, timeout=(10, timeout), stream=True)
-            if response.status_code >= 400:
-                raise RuntimeError(f'HTTP {response.status_code}: {response.text[:900]}')
             raw_parts = []
             usage = None
             finish_reason = None
-            for raw_line in response.iter_lines(decode_unicode=True):
-                line = (raw_line or '').strip()
-                if not line.startswith('data:'):
-                    continue
-                data = line[5:].strip()
-                if data == '[DONE]':
-                    break
-                try:
-                    chunk = json.loads(data)
-                except Exception:
-                    continue
-                choices = chunk.get('choices') or [{}]
-                delta = (choices[0].get('delta') or {}) if choices else {}
-                if delta.get('content'):
-                    raw_parts.append(delta['content'])
-                if choices and choices[0].get('finish_reason'):
-                    finish_reason = choices[0]['finish_reason']
-                if chunk.get('usage'):
-                    usage = chunk['usage']
+            async with session.post('http://menshen.xdf.cn/v1/chat/completions',
+                                    headers={'Authorization': token, 'Content-Type': 'application/json'},
+                                    json=body, timeout=aiohttp.ClientTimeout(total=timeout, connect=10)) as response:
+                if response.status >= 400:
+                    text = (await response.text())[:900]
+                    raise RuntimeError(f'HTTP {response.status}: {text}')
+                async for data in _iter_sse_data(response.content):
+                    if data == '[DONE]':
+                        break
+                    try:
+                        chunk = json.loads(data)
+                    except Exception:
+                        continue
+                    choices = chunk.get('choices') or [{}]
+                    delta = (choices[0].get('delta') or {}) if choices else {}
+                    if delta.get('content'):
+                        raw_parts.append(delta['content'])
+                    if choices and choices[0].get('finish_reason'):
+                        finish_reason = choices[0]['finish_reason']
+                    if chunk.get('usage'):
+                        usage = chunk['usage']
             raw = ''.join(raw_parts)
             return raw, errors, {'usage': usage, 'finish_reason': finish_reason, 'options': options,
                                  'sent_images': sum(bool(x.get('data_url')) for x in images),
@@ -385,7 +471,7 @@ def model_call(session, prompt, images, model, token, timeout, retries):
         except Exception as e:
             errors.append(f'attempt={attempt+1}: {type(e).__name__}: {e}')
             if attempt < retries:
-                time.sleep(min(2 ** attempt, 8))
+                await asyncio.sleep(min(2 ** attempt, 8))
     return '', errors, {'options': options, 'sent_images': sum(bool(x.get('data_url')) for x in images),
                         '模型耗时秒': round(time.perf_counter() - call_started, 2), '尝试次数': retries + 1}
 
@@ -566,7 +652,7 @@ def output_review(path, records, dims):
     path.write_text(page, encoding='utf-8')
 
 
-def main():
+async def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('subject', choices=CONFIG)
     parser.add_argument('--limit', type=int, default=200)
@@ -616,8 +702,12 @@ def main():
     else:
         keys, timestamp = {}, ''
     selection_file = folder / '抽样题目ID.json'
-    if selection_file.exists() and json.loads(selection_file.read_text(encoding='utf-8')) != selected:
-        raise RuntimeError('该输出目录属于不同题目列表，请另选输出目录，避免断点结果混淆')
+    if selection_file.exists():
+        old_selected = json.loads(selection_file.read_text(encoding='utf-8'))
+        # 允许“在原列表基础上向后追加题目”的续跑：旧列表是当前列表的前缀即可；
+        # 完全不同的题目列表仍然拒绝，避免断点结果混淆。
+        if selected[:len(old_selected)] != old_selected:
+            raise RuntimeError('该输出目录属于不同题目列表，请另选输出目录，避免断点结果混淆')
     selection_file.write_text(json.dumps(selected, ensure_ascii=False, indent=2), encoding='utf-8')
     checkpoint = folder / '中间结果.json'
     results = json.loads(checkpoint.read_text(encoding='utf-8')) if checkpoint.exists() else {}
@@ -629,16 +719,17 @@ def main():
     batch_model_elapsed = 0.0
     batch_status = OrderedDict()
 
-    def process(qid):
-        # requests.Session 不跨线程共享；每道题独立取题、下载图片并调用模型。
-        # 函数只返回结果，主线程负责落盘，避免并发写入 JSONL/断点文件造成文件损坏。
+    async def process(qid, session):
+        # aiohttp.ClientSession 由外层统一创建共享；函数只返回结果，主协程负责落盘。
         question_started = time.perf_counter()
-        session = requests.Session()
         if qid in local_questions:
             payload, questions, fetch_errors = None, local_questions[qid], []
         else:
-            payload, questions, fetch_errors = fetch_questions(session, 'https://tps-tiku-api.staff.xdf.cn/api/question/v2/query-by-questionIds',
-                                                                keys, qid, (10, args.timeout), args.retries, timestamp)
+            sync_session = requests.Session()
+            payload, questions, fetch_errors = await asyncio.to_thread(
+                fetch_questions, sync_session, 'https://tps-tiku-api.staff.xdf.cn/api/question/v2/query-by-questionIds',
+                keys, qid, (10, args.timeout), args.retries, timestamp)
+            sync_session.close()
         prompt = ''
         images = []
         raw = ''
@@ -649,9 +740,9 @@ def main():
         status = '失败'
         if questions:
             prompt = make_prompt(args.subject, qid, questions, catalog, guidance)
-            images = create_images(session, image_urls(questions), folder / 'images' / qid, min(args.timeout, 30))
+            images = await create_images(session, image_urls(questions), folder / 'images' / qid, min(args.timeout, 30))
             errors += [f"图片：{x['url']} {x['error']}" for x in images if x.get('error')]
-            raw, call_errors, meta = model_call(session, prompt, images, args.model, token, args.timeout, args.retries)
+            raw, call_errors, meta = await model_call(session, prompt, images, args.model, token, args.timeout, args.retries)
             errors += call_errors
             if raw:
                 try:
@@ -695,13 +786,24 @@ def main():
                   'tags': tags, 'remarks': remarks, 'status': status, 'errors': errors,
                   'elapsed': elapsed, 'usage': usage,
                   'images': [{k: v for k, v in item.items() if k != 'data_url'} for item in images], 'row': row}
-        session.close()
         audit_record = {'大题ID': qid, '题目来源': '本地JSONL' if qid in local_questions else '题库接口',
                         '题库错误': fetch_errors, '题目': record['questions'],
                         '图片': record['images'], '模型': args.model, '模型输入': prompt, '模型输出': raw,
                         '模型元数据': meta, '耗时秒': elapsed, 'token用量': usage,
                         '标签': tags, '备注': remarks, '状态': status, '错误': errors}
-        return record, audit_record, len(questions), meta.get('sent_images', 0)
+        return qid, record, audit_record, len(questions), meta.get('sent_images', 0)
+
+    async def safe_process(qid, session, sem):
+        async with sem:
+            try:
+                return await process(qid, session)
+            except Exception as exc:
+                error = f'处理异常：{type(exc).__name__}: {exc}'
+                row = {'大题ID': qid, '状态': '失败', '错误信息': error}
+                record = {'id': qid, 'questions': [], 'tags': {d: [] for d in conf['dimensions']},
+                          'remarks': [], 'images': [], 'status': '失败', 'errors': [error], 'row': row}
+                audit_record = {'大题ID': qid, '状态': '失败', '错误': [error]}
+                return qid, record, audit_record, 0, 0
 
     # 先处理从未完成的题，再重试失败题；可选地补跑“成功但图片缺失”的记录。
     pending = [qid for qid in selected if qid not in results]
@@ -712,19 +814,11 @@ def main():
     if args.max_new is not None:
         pending = pending[:args.max_new]
     print(f'{args.subject}：共 {len(selected)} 道，本批待处理 {len(pending)} 道，并发 {args.workers}', flush=True)
-    with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        futures = {executor.submit(process, qid): qid for qid in pending}
-        for future in as_completed(futures):
-            qid = futures[future]
-            try:
-                record, audit_record, part_count, sent_images = future.result()
-            except Exception as exc:
-                error = f'处理异常：{type(exc).__name__}: {exc}'
-                row = {'大题ID': qid, '状态': '失败', '错误信息': error}
-                record = {'id': qid, 'questions': [], 'tags': {d: [] for d in conf['dimensions']},
-                          'remarks': [], 'images': [], 'status': '失败', 'errors': [error], 'row': row}
-                audit_record = {'大题ID': qid, '状态': '失败', '错误': [error]}
-                part_count = sent_images = 0
+    sem = asyncio.Semaphore(args.workers)
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as http_session:
+        tasks = [asyncio.create_task(safe_process(qid, http_session, sem)) for qid in pending]
+        for fut in asyncio.as_completed(tasks):
+            qid, record, audit_record, part_count, sent_images = await fut
             usage = record.get('usage') or empty_usage()
             elapsed = float(record.get('elapsed') or 0)
             batch_usage = add_usage(batch_usage, usage)
@@ -790,4 +884,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    asyncio.run(main())
