@@ -17,3 +17,6 @@ outputs/
 # 备份与临时文件
 *.bak*
 .~*
+
+# 打标输出（大文件，不提交）
+question_bank_process/output/

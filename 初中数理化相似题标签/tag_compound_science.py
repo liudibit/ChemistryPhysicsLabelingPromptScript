@@ -153,6 +153,52 @@ def _jsonl_image_urls(value):
     return unique(urls)
 
 
+PARENT_COMPLETE_IMAGE_FIELDS = {
+    'stem': 'stemImageUrl',
+    'analysis': 'analysisImageUrl',
+    'answer': 'answerImageUrl',
+}
+
+
+def parent_output_image_urls(questions):
+    """最终结果只取父题的三张完整外置截图，不影响模型输入图片。
+
+    题目固定取父题题干截图；解析、答案固定取父题解析/答案截图。优先读取
+    原始题目的同名独立字段，兼容旧断点时再从父题 fieldImages 中取外置截图。
+    """
+    if not questions:
+        return {field: '' for field in PARENT_COMPLETE_IMAGE_FIELDS}
+    parent = questions[0] or {}
+    raw = parent.get('raw') if isinstance(parent.get('raw'), dict) else {}
+    info = raw.get('questionInfo') if isinstance(raw.get('questionInfo'), dict) else {}
+    field_images = parent.get('fieldImages') or parent.get('images') or {}
+    result = {}
+    for field, source_name in PARENT_COMPLETE_IMAGE_FIELDS.items():
+        urls = []
+        for source in (raw, info):
+            urls = _jsonl_image_urls(source.get(source_name))
+            if urls:
+                break
+        if not urls:
+            # 旧断点只保存了归一化后的父题 fieldImages，没有原始独立字段。
+            field_urls = _jsonl_image_urls(field_images.get(field))
+            urls = [url for url in field_urls if '/k12/image/externalized/' in url]
+        result[field] = urls[0] if urls else ''
+    return result
+
+
+def output_row(record):
+    """生成 Excel 行；仅收敛最终输出链接，record.questions 仍保留模型输入原貌。"""
+    row = dict(record.get('row') or {})
+    images = parent_output_image_urls(record.get('questions') or [])
+    row.update({
+        '题干图片': images['stem'],
+        '解析图片': images['analysis'],
+        '答案图片': images['answer'],
+    })
+    return row
+
+
 def load_jsonl_compound_questions(path):
     """从本地 JSONL 读取复合题，支持两种格式。
 
@@ -611,6 +657,7 @@ def output_excel(path, rows, dims):
     ws.title = '大题标签'
     columns = ['大题ID', '小题ID', '题干图片', '解析图片', '答案图片', *dims, '备注', '状态', '错误信息',
                '耗时秒', '输入tokens', '输出tokens', '思考tokens']
+    link_column_indexes = {columns.index(name) + 1 for name in ('题干图片', '解析图片', '答案图片')}
     ws.append(columns)
     for c in ws[1]:
         c.fill = PatternFill('solid', fgColor='23544B')
@@ -624,6 +671,11 @@ def output_excel(path, rows, dims):
     for row in ws.iter_rows(min_row=2):
         for c in row:
             c.alignment = Alignment(vertical='top', wrap_text=True)
+            if c.column in link_column_indexes:
+                url = str(c.value or '').strip()
+                if url.startswith(('http://', 'https://')):
+                    c.hyperlink = url
+                    c.style = 'Hyperlink'
     wb.save(path)
 
 
@@ -836,10 +888,10 @@ async def main():
                   f'部分数={part_count}，已发送图片={sent_images}，错误={len(record["errors"])}，'
                   f'耗时={elapsed:.1f}s，tokens=入{usage["输入tokens"]}/出{usage["输出tokens"]}（思考{usage["思考tokens"]}）', flush=True)
             if completed % 10 == 0:
-                output_excel(folder / '大题级标签.xlsx', [results[i]['row'] for i in selected if i in results], conf['dimensions'])
+                output_excel(folder / '大题级标签.xlsx', [output_row(results[i]) for i in selected if i in results], conf['dimensions'])
                 output_review(folder / 'review' / '人工复核.html', [results[i] for i in selected if i in results], conf['dimensions'])
     # 断点续跑时即便所有题目已完成，也重新生成页面，确保页面模板更新生效。
-    output_excel(folder / '大题级标签.xlsx', [results[i]['row'] for i in selected if i in results], conf['dimensions'])
+    output_excel(folder / '大题级标签.xlsx', [output_row(results[i]) for i in selected if i in results], conf['dimensions'])
     output_review(folder / 'review' / '人工复核.html', [results[i] for i in selected if i in results], conf['dimensions'])
     # 汇总本次运行的耗时与 token；累计口径按大题 ID 去重后从审计文件回算，断点续跑不会重复计数。
     wall_seconds = time.perf_counter() - run_started
